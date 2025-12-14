@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Production MKV WASM Player</title>
+    <link rel="stylesheet" href="./src/style.css">
+    <link href="https://vjs.zencdn.net/8.0.4/video-js.css" rel="stylesheet" />
+    <style>
+        /* Custom tweaks */
+        body { margin: 0; background: #000; color: #fff; font-family: 'Inter', sans-serif; }
+        .player-container { width: 100vw; height: 100vh; display: flex; align-items: center; justify-content: center; background: radial-gradient(circle at center, #1a1a1a 0%, #000 100%); }
+        .video-js { width: 80%; height: 80%; max-width: 1200px; max-height: 800px; border-radius: 12px; overflow: hidden; box-shadow: 0 0 50px rgba(0,0,0,0.5); }
+        .vjs-tech { pointer-events: none; } /* Let Video.js UI handle clicks */
+    </style>
+  </head>
+  <body>
+    <div class="player-container">
+      <video-js id="my-player" class="video-js vjs-big-play-centered" controls preload="auto">
+        <p class="vjs-no-js">
+          To view this video please enable JavaScript.
+        </p>
+      </video-js>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
