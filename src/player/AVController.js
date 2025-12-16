@@ -2,26 +2,31 @@
  * AVController
  * 
  * Manages the synchronization between Audio and Video.
- * Acts as the 'Master Clock' using the AudioContext's time.
+ * Uses a simple audio queue with ScriptProcessorNode for reliable playback.
  */
 export class AVController {
     constructor(canvas, context, onTimeUpdate) {
         this.canvas = canvas;
         this.ctx = context;
-        this.onTimeUpdate = onTimeUpdate; // Callback for UI updates
+        this.onTimeUpdate = onTimeUpdate;
 
         // State
-        this.videoQueue = []; // Array of { frame: VideoFrame, pts: number }
-        this.audioStartTime = 0; // The AudioContext time when playback started/resumed
-        this.mediaStartTime = 0; // The Media (PTS) time when playback started/resumed
+        this.videoQueue = [];
+        this.audioQueue = []; // Queue of { samples: Float32Array[], sampleRate: number }
+        this.audioReadIndex = 0;
+        this.currentAudioChunk = null;
+
+        this.audioStartTime = 0;
+        this.mediaStartTime = 0;
         this.isPlaying = false;
 
         this.audioContext = null;
         this.audioGain = null;
-        this.nextAudioScheduleTime = 0;
+        this.scriptProcessor = null;
+        this.outputSampleRate = 48000;
 
         // Config
-        this.syncThreshold = 0.05; // 50ms tolerance
+        this.syncThreshold = 0.05;
 
         // Loop
         this.animationFrameId = null;
@@ -30,29 +35,100 @@ export class AVController {
     initAudio() {
         if (!this.audioContext) {
             this.audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            this.outputSampleRate = this.audioContext.sampleRate;
+            console.log('[AVController] AudioContext sampleRate:', this.outputSampleRate);
+
             this.audioGain = this.audioContext.createGain();
             this.audioGain.connect(this.audioContext.destination);
+
+            // Use ScriptProcessorNode for reliable audio output
+            // Buffer size 4096 gives us good latency without underruns
+            this.scriptProcessor = this.audioContext.createScriptProcessor(4096, 0, 2);
+            this.scriptProcessor.onaudioprocess = this.processAudio.bind(this);
+            this.scriptProcessor.connect(this.audioGain);
+
+            console.log('[AVController] Audio initialized with ScriptProcessor');
         }
     }
 
-    play() {
+    processAudio(event) {
+        const outputL = event.outputBuffer.getChannelData(0);
+        const outputR = event.outputBuffer.getChannelData(1);
+        const bufferSize = outputL.length;
+
+        if (!this.isPlaying) {
+            outputL.fill(0);
+            outputR.fill(0);
+            return;
+        }
+
+        let written = 0;
+
+        while (written < bufferSize) {
+            // Get next chunk if needed
+            if (!this.currentAudioChunk && this.audioQueue.length > 0) {
+                this.currentAudioChunk = this.audioQueue.shift();
+                this.audioReadIndex = 0;
+            }
+
+            if (!this.currentAudioChunk) {
+                // Buffer underrun - fill with silence
+                for (let i = written; i < bufferSize; i++) {
+                    outputL[i] = 0;
+                    outputR[i] = 0;
+                }
+                break;
+            }
+
+            const chunk = this.currentAudioChunk;
+            const chunkSamples = chunk.samples[0].length;
+            const inputSampleRate = chunk.sampleRate;
+
+            // Calculate resampling ratio
+            const ratio = inputSampleRate / this.outputSampleRate;
+
+            // Resample and output
+            while (written < bufferSize && this.audioReadIndex < chunkSamples) {
+                const srcIdx = Math.floor(this.audioReadIndex);
+                const nextIdx = Math.min(srcIdx + 1, chunkSamples - 1);
+                const frac = this.audioReadIndex - srcIdx;
+
+                // Linear interpolation
+                const sampleL = chunk.samples[0][srcIdx] * (1 - frac) + chunk.samples[0][nextIdx] * frac;
+                const sampleR = chunk.samples.length > 1
+                    ? chunk.samples[1][srcIdx] * (1 - frac) + chunk.samples[1][nextIdx] * frac
+                    : sampleL;
+
+                outputL[written] = sampleL;
+                outputR[written] = sampleR;
+                written++;
+
+                // Advance by the resampling ratio
+                this.audioReadIndex += ratio;
+            }
+
+            // Check if we've consumed the chunk
+            if (this.audioReadIndex >= chunkSamples) {
+                this.currentAudioChunk = null;
+                this.audioReadIndex = 0;
+            }
+        }
+    }
+
+    async play() {
         if (this.isPlaying) return;
 
         this.initAudio();
         if (this.audioContext.state === 'suspended') {
-            this.audioContext.resume();
+            await this.audioContext.resume();
         }
 
         this.isPlaying = true;
-
-        // Reset reference times
-        // Master Clock = (AudioContext.currentTime - this.audioStartTime) + this.mediaStartTime
         this.audioStartTime = this.audioContext.currentTime;
 
-        // If we are just starting, mediaStartTime is roughly where we left off
-        // For accurate seek, this needs to be set by the seek handler
-
-        this.nextAudioScheduleTime = Math.max(this.audioContext.currentTime, this.nextAudioScheduleTime);
+        // Don't clear audio queue - it should have audio from timestamp 0
+        // Just reset the read position for any current chunk
+        this.audioReadIndex = 0;
 
         this.renderLoop();
     }
@@ -65,67 +141,50 @@ export class AVController {
         if (this.animationFrameId) {
             cancelAnimationFrame(this.animationFrameId);
         }
-        // Save current media time for resume? 
-        // In a real app we'd track 'lastKnownTime'
     }
 
-    /**
-     * Called when WebCodecs outputs a video frame.
-     */
     enqueueVideoFrame(frame) {
-        // pts is in microseconds usually from WebCodecs, convert to seconds
         const pts = frame.timestamp / 1e6;
-        // console.log('[AVController] VideoFrame enqueued. PTS:', pts);
         this.videoQueue.push({ frame, pts });
-        // Sort? Usually WebCodecs outputs in order, but B-frames might complicate.
-        // Assuming output is presentation order for now.
     }
 
-    /**
-     * Called when WebCodecs outputs audio data.
-     */
     enqueueAudioData(audioData) {
-        if (!this.audioContext) return;
+        // Queue audio even before play starts (same as video)
+        // The ScriptProcessor will output silence when not playing
 
-        // Format conversion (simplified)
-        // In prod: use AudioWorklet for glitch-free streaming. 
-        // Here: Schedule BufferSource nodes.
-        const frameCount = audioData.numberOfFrames;
-        const channels = audioData.numberOfChannels;
-        const sampleRate = audioData.sampleRate;
+        try {
+            const frameCount = audioData.numberOfFrames;
+            const channels = audioData.numberOfChannels;
+            const sampleRate = audioData.sampleRate;
 
-        const audioBuffer = this.audioContext.createBuffer(channels, frameCount, sampleRate);
+            // Extract samples
+            const samples = [];
+            for (let i = 0; i < channels; i++) {
+                const dest = new Float32Array(frameCount);
+                audioData.copyTo(dest, { planeIndex: i, format: 'f32-planar' });
+                samples.push(dest);
+            }
 
-        for (let i = 0; i < channels; i++) {
-            // copyTo requires a destination buffer. 
-            // Allocation per packet is expensive, reuse in prod.
-            const dest = new Float32Array(frameCount);
-            audioData.copyTo(dest, { planeIndex: 0, format: 'f32-planar' }); // Adjust for planar/interleaved
-            audioBuffer.copyToChannel(dest, i);
+            // Queue the audio chunk
+            this.audioQueue.push({
+                samples: samples,
+                sampleRate: sampleRate
+            });
+
+        } catch (e) {
+            console.error('[AVController] Audio enqueue error:', e);
         }
-
-        const source = this.audioContext.createBufferSource();
-        source.buffer = audioBuffer;
-        source.connect(this.audioGain);
-
-        // Schedule
-        let scheduleTime = this.nextAudioScheduleTime;
-        if (scheduleTime < this.audioContext.currentTime) {
-            scheduleTime = this.audioContext.currentTime;
-        }
-
-        source.start(scheduleTime);
-        this.nextAudioScheduleTime = scheduleTime + audioBuffer.duration;
 
         audioData.close();
     }
 
     reset() {
-        // Flush queues
         this.videoQueue.forEach(i => i.frame.close());
         this.videoQueue = [];
-        this.nextAudioScheduleTime = 0;
-        this.mediaStartTime = 0; // Reset or set to seek target
+        this.audioQueue = [];
+        this.currentAudioChunk = null;
+        this.audioReadIndex = 0;
+        this.mediaStartTime = 0;
     }
 
     renderLoop() {
@@ -133,7 +192,6 @@ export class AVController {
 
         this.processVideoQueue();
 
-        // Report time
         const currentTime = this.getMasterTime();
         if (this.onTimeUpdate) this.onTimeUpdate(currentTime);
 
@@ -144,39 +202,32 @@ export class AVController {
         if (this.videoQueue.length === 0) return;
 
         const now = this.getMasterTime();
-        console.log('[AVController] Time:', now, 'QueueLen:', this.videoQueue.length, 'NextPTS:', this.videoQueue[0] ? this.videoQueue[0].pts : 'N/A');
+        // console.log('[AVController] Time:', now, 'QueueLen:', this.videoQueue.length);
 
-        // Drop late frames
         while (this.videoQueue.length > 0) {
             const nextFrame = this.videoQueue[0];
             const diff = nextFrame.pts - now;
 
             if (diff < -this.syncThreshold) {
-                // Too late, drop
-                console.warn('[AVController] Dropping late frame. Diff:', diff);
+                // console.warn('[AVController] Dropping late frame. Diff:', diff);
                 nextFrame.frame.close();
                 this.videoQueue.shift();
                 continue;
             }
 
             if (diff <= this.syncThreshold) {
-                // Time to render!
-                // console.log('[AVController] Rendering frame. PTS:', nextFrame.pts);
                 this.renderFrame(nextFrame.frame);
-                nextFrame.frame.close(); // Important!
+                nextFrame.frame.close();
                 this.videoQueue.shift();
-                // Check next frame immediately in case we are behind multiple frames
                 continue;
             }
 
-            // Next frame is in the future
             break;
         }
     }
 
     renderFrame(frame) {
         if (!this.canvas) return;
-        // Resize canvas if needed
         if (this.canvas.width !== frame.displayWidth || this.canvas.height !== frame.displayHeight) {
             this.canvas.width = frame.displayWidth;
             this.canvas.height = frame.displayHeight;
@@ -185,18 +236,15 @@ export class AVController {
     }
 
     getMasterTime() {
-        // Simple Audio Master Clock calculation
         if (!this.audioContext) return 0;
-        // Correct logic:
-        // When we play, we note audioStartTime (AC time).
-        // Current VPTS = (AC.currentTime - audioStartTime) + mediaStartTime
-        // Note: This drifts if audio underruns. Production requires checking AudioContext.outputLatency etc.
         return (this.audioContext.currentTime - this.audioStartTime) + this.mediaStartTime;
     }
 
     seek(time) {
         this.mediaStartTime = time;
         this.audioStartTime = this.audioContext ? this.audioContext.currentTime : 0;
-        this.nextAudioScheduleTime = this.audioStartTime;
+        this.audioQueue = [];
+        this.currentAudioChunk = null;
+        this.audioReadIndex = 0;
     }
 }

@@ -11,8 +11,10 @@ export class MkvWasmTech extends Tech {
         super(options, ready);
 
         this.worker = null;
-        this.audioDecoder = null;
         this.videoDecoder = null;
+        this.audioDecoder = null;
+        this.videoTrackId = null;
+        this.audioTrackId = null;
         this.videoCanvas = null;
         this.ctx = null;
         this.audioContext = null;
@@ -84,10 +86,10 @@ export class MkvWasmTech extends Tech {
         this.trigger('waiting');
     }
 
-    play() {
+    async play() {
         if (this.internalPaused) {
             this.internalPaused = false;
-            this.avController.play();
+            await this.avController.play();
             this.trigger('play');
         }
     }
@@ -176,13 +178,14 @@ export class MkvWasmTech extends Tech {
             this.videoTrackId = metadata.videoTrack.trackId;
             this.setupVideoDecoder(metadata.videoTrack);
         }
-        // Setup Audio always if possible
+        // Setup Audio
         if (metadata.audioTracks && metadata.audioTracks.length > 0) {
-            this.setupAudioDecoder(metadata.audioTracks[0]);
+            const audioTrack = metadata.audioTracks[0];
+            this.audioTrackId = audioTrack.trackId;
+            this.setupAudioDecoder(audioTrack);
         } else {
-            // If no audio track, AVController needs to know to run in 'Video Only' mode (fallback clock)
-            // For now, assuming audio exists as per prototype constraints
-            this.avController.initAudio(); // Ensure context is ready
+            console.log('[MkvWasmTech] No audio tracks found');
+            this.avController.initAudio(); // Ensure context is ready for video-only
         }
         this.trigger('loadedmetadata');
         // Signal that we have enough data to start
@@ -191,11 +194,19 @@ export class MkvWasmTech extends Tech {
     }
 
     setupVideoDecoder(config) {
-        // config: { codec, description (Array), codedWidth, codedHeight }
+        // config: { codec, codecId, description (Array), codedWidth, codedHeight }
         if (!('VideoDecoder' in window)) {
             console.error('WebCodecs VideoDecoder not supported');
             return;
         }
+
+        console.log('[MkvWasmTech] Video Track Info:', {
+            codec: config.codec,
+            codecId: config.codecId,
+            width: config.codedWidth,
+            height: config.codedHeight,
+            hasDescription: !!config.description
+        });
 
         // Prepare Description
         let description = null;
@@ -213,37 +224,92 @@ export class MkvWasmTech extends Tech {
             decoderConfig.description = description;
         }
 
-        console.log('[MkvWasmTech] Configuring VideoDecoder:', decoderConfig);
+        // Check if codec is supported
+        VideoDecoder.isConfigSupported(decoderConfig).then((result) => {
+            console.log('[MkvWasmTech] Codec Support Check:', result.supported, result.config);
+            if (!result.supported) {
+                console.error('[MkvWasmTech] Codec NOT SUPPORTED:', config.codec, config.codecId);
+                return;
+            }
 
-        this.videoDecoder = new VideoDecoder({
-            output: this.handleVideoFrame.bind(this),
-            error: (e) => console.error('VideoDecoder error:', e)
+            this.videoDecoder = new VideoDecoder({
+                output: this.handleVideoFrame.bind(this),
+                error: (e) => console.error('VideoDecoder error:', e)
+            });
+
+            try {
+                this.videoDecoder.configure(result.config || decoderConfig);
+                console.log('[MkvWasmTech] VideoDecoder configured successfully');
+            } catch (e) {
+                console.error('[MkvWasmTech] VideoDecoder Configuration Failed:', e);
+            }
+        }).catch((e) => {
+            console.error('[MkvWasmTech] isConfigSupported error:', e);
         });
-
-        try {
-            this.videoDecoder.configure(decoderConfig);
-        } catch (e) {
-            console.error('[MkvWasmTech] VideoDecoder Configuration Failed:', e);
-        }
     }
 
     setupAudioDecoder(config) {
+        // config: { codec, codecId, sampleRate, numberOfChannels, description }
         if (!('AudioDecoder' in window)) {
             console.error('WebCodecs AudioDecoder not supported');
             return;
         }
-        this.audioDecoder = new AudioDecoder({
-            output: this.handleAudioFrame.bind(this),
-            error: (e) => console.error('AudioDecoder error:', e)
+
+        console.log('[MkvWasmTech] Audio Track Info:', {
+            codec: config.codec,
+            codecId: config.codecId,
+            sampleRate: config.sampleRate,
+            numberOfChannels: config.numberOfChannels,
+            hasDescription: !!config.description
         });
-        this.audioDecoder.configure(config);
+
+        // Prepare Description
+        let description = null;
+        if (config.description && Array.isArray(config.description)) {
+            description = new Uint8Array(config.description);
+        }
+
+        const decoderConfig = {
+            codec: config.codec,
+            sampleRate: config.sampleRate,
+            numberOfChannels: config.numberOfChannels
+        };
+
+        if (description) {
+            decoderConfig.description = description;
+        }
+
+        // Check if codec is supported
+        AudioDecoder.isConfigSupported(decoderConfig).then((result) => {
+            console.log('[MkvWasmTech] Audio Codec Support Check:', result.supported, result.config);
+            if (!result.supported) {
+                console.error('[MkvWasmTech] Audio Codec NOT SUPPORTED:', config.codec, config.codecId);
+                return;
+            }
+
+            this.audioDecoder = new AudioDecoder({
+                output: this.handleAudioFrame.bind(this),
+                error: (e) => console.error('AudioDecoder error:', e)
+            });
+
+            try {
+                this.audioDecoder.configure(result.config || decoderConfig);
+                console.log('[MkvWasmTech] AudioDecoder configured successfully');
+                // Initialize audio context NOW so it's ready for incoming audio
+                this.avController.initAudio();
+            } catch (e) {
+                console.error('[MkvWasmTech] AudioDecoder Configuration Failed:', e);
+            }
+        }).catch((e) => {
+            console.error('[MkvWasmTech] Audio isConfigSupported error:', e);
+        });
     }
 
     queuePacket(packet) {
         // packet: { trackId, timestamp, isKey, data }
         if (this.videoDecoder && packet.trackId === this.videoTrackId) {
             try {
-                // console.log(`[MkvWasmTech] Queueing Packet. TS: ${packet.timestamp}, Key: ${packet.isKey}, Size: ${packet.data.byteLength}`);
+                // console.log('[MkvWasmTech] Video Packet TS:', packet.timestamp, 'ms');
                 const chunk = new EncodedVideoChunk({
                     type: packet.isKey ? 'key' : 'delta',
                     timestamp: packet.timestamp * 1000, // ms -> microseconds
@@ -251,12 +317,20 @@ export class MkvWasmTech extends Tech {
                 });
                 this.videoDecoder.decode(chunk);
             } catch (e) {
-                console.error('[MkvWasmTech] Decode Error:', e);
+                console.error('[MkvWasmTech] Video Decode Error:', e);
             }
-        } else if (this.audioDecoder) {
-            // Audio logic to be implemented fully later, for now check trackId if we had audioTrackId
-            // const chunk = new EncodedAudioChunk(packet.chunk);
-            // this.audioDecoder.decode(chunk);
+        } else if (this.audioDecoder && packet.trackId === this.audioTrackId) {
+            // Decode audio immediately (same as video) so both queues start from timestamp 0
+            try {
+                const chunk = new EncodedAudioChunk({
+                    type: 'key',
+                    timestamp: packet.timestamp * 1000, // ms -> microseconds
+                    data: packet.data
+                });
+                this.audioDecoder.decode(chunk);
+            } catch (e) {
+                console.error('[MkvWasmTech] Audio Decode Error:', e);
+            }
         }
     }
 

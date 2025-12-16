@@ -51,28 +51,32 @@ async function initWasm() {
 }
 
 async function startStream(url) {
-    console.log('Worker: Starting stream for', url);
     fetching = true;
     tracksFound = false;
     abortController = new AbortController();
 
     try {
         const response = await fetch(url, { signal: abortController.signal });
+
+        if (!response.ok) {
+            throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+        }
         if (!response.body) throw new Error('No body');
 
         const reader = response.body.getReader();
 
         while (fetching) {
             const { done, value } = await reader.read();
-            if (done) break;
+            if (done) {
+                break;
+            }
 
             if (!demuxer) {
                 console.error('Demuxer is null inside fetch loop!');
                 break;
             }
 
-            // Push data to C++ (expects std::string from Uint8Array)
-            // Implicit conversion should handle Uint8Array -> std::string via Embind
+            // Push data to C++
             demuxer.push_data(value);
 
             if (!tracksFound) {

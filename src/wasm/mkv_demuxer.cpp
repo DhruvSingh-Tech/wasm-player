@@ -154,8 +154,13 @@ public:
                       std::string codecId = "";
                       uint64_t trackNum = 0;
                       val codecPrivate = val::null();
+                      // Video properties
                       uint64_t width = 0;
                       uint64_t height = 0;
+                      // Audio properties
+                      double sampleRate = 0;
+                      uint64_t channels = 0;
+                      uint64_t bitDepth = 0;
                       
                       // Iterate children of Entry manually
                       for (size_t j = 0; j < entry->ListSize(); j++) {
@@ -195,19 +200,121 @@ public:
                                       height = uint64_t(*static_cast<KaxVideoPixelHeight*>(ve));
                                   }
                               }
+                          } else if (EbmlId(*e) == KaxTrackAudio::ClassInfos.GlobalId) {
+                              KaxTrackAudio* aud = static_cast<KaxTrackAudio*>(e);
+                              // Iterate audio properties
+                              for (size_t k = 0; k < aud->ListSize(); k++) {
+                                  EbmlElement* ae = (*aud)[k];
+                                  if (EbmlId(*ae) == KaxAudioSamplingFreq::ClassInfos.GlobalId) {
+                                      sampleRate = double(*static_cast<KaxAudioSamplingFreq*>(ae));
+                                  } else if (EbmlId(*ae) == KaxAudioChannels::ClassInfos.GlobalId) {
+                                      channels = uint64_t(*static_cast<KaxAudioChannels*>(ae));
+                                  } else if (EbmlId(*ae) == KaxAudioBitDepth::ClassInfos.GlobalId) {
+                                      bitDepth = uint64_t(*static_cast<KaxAudioBitDepth*>(ae));
+                                  }
+                              }
                           }
                       }
                       
                       if (trackType == track_video) {
                              val videoTrack = val::object();
                              videoTrack.set("trackId", (int)trackNum);
-                             videoTrack.set("codec", "avc1.64001E"); // Fallback or map from codecId
+                             
+                             // Map MKV CodecID to WebCodecs codec string
+                             std::string webCodec = "";
+                             if (codecId == "V_MPEG4/ISO/AVC") {
+                                 // H.264 - Parse avcC to get profile/level
+                                 // avcC format: [version][profile][profile_compat][level]...
+                                 if (codecPrivate.as<bool>()) {
+                                     // Get first few bytes from codecPrivate array
+                                     int len = codecPrivate["length"].as<int>();
+                                     if (len >= 4) {
+                                         uint8_t profile = codecPrivate[1].as<int>();
+                                         uint8_t profileCompat = codecPrivate[2].as<int>();
+                                         uint8_t level = codecPrivate[3].as<int>();
+                                         char codecStr[32];
+                                         snprintf(codecStr, sizeof(codecStr), "avc1.%02X%02X%02X", profile, profileCompat, level);
+                                         webCodec = codecStr;
+                                     } else {
+                                         webCodec = "avc1.640028"; // Default High profile
+                                     }
+                                 } else {
+                                     webCodec = "avc1.640028"; // Default High profile
+                                 }
+                             } else if (codecId == "V_MPEGH/ISO/HEVC") {
+                                 // H.265/HEVC
+                                 webCodec = "hvc1.1.6.L93.B0"; // Common Main profile
+                             } else if (codecId == "V_VP8") {
+                                 webCodec = "vp8";
+                             } else if (codecId == "V_VP9") {
+                                 webCodec = "vp09.00.10.08"; // Profile 0
+                             } else if (codecId == "V_AV1") {
+                                 webCodec = "av01.0.01M.08"; // Main profile
+                             } else {
+                                 // Unknown codec, log it
+                                 printf("Unknown video codec: %s\n", codecId.c_str());
+                                 webCodec = "avc1.640028"; // Fallback
+                             }
+                             
+                             videoTrack.set("codec", webCodec);
+                             videoTrack.set("codecId", codecId); // Also pass raw codecId for debugging
+                             
                              if (codecPrivate.as<bool>()) {
                                  videoTrack.set("description", codecPrivate);
                              }
                              videoTrack.set("codedWidth", (int)width > 0 ? (int)width : 1280); 
                              videoTrack.set("codedHeight", (int)height > 0 ? (int)height : 720);
                              metadata.set("videoTrack", videoTrack);
+                      } else if (trackType == track_audio) {
+                             val audioTrack = val::object();
+                             audioTrack.set("trackId", (int)trackNum);
+                             
+                             // Map MKV CodecID to WebCodecs codec string
+                             std::string webCodec = "";
+                             if (codecId == "A_AAC" || codecId.rfind("A_AAC/", 0) == 0) {
+                                 // AAC - Need to specify profile
+                                 // Common: mp4a.40.2 (AAC-LC), mp4a.40.5 (HE-AAC)
+                                 webCodec = "mp4a.40.2"; // Default to AAC-LC
+                             } else if (codecId == "A_OPUS") {
+                                 webCodec = "opus";
+                             } else if (codecId == "A_VORBIS") {
+                                 webCodec = "vorbis";
+                             } else if (codecId == "A_MPEG/L3") {
+                                 webCodec = "mp3";
+                             } else if (codecId == "A_AC3") {
+                                 webCodec = "ac-3";
+                             } else if (codecId == "A_EAC3") {
+                                 webCodec = "ec-3";
+                             } else if (codecId == "A_FLAC") {
+                                 webCodec = "flac";
+                             } else if (codecId == "A_DTS" || codecId.rfind("A_DTS/", 0) == 0) {
+                                 // DTS is generally not supported in browsers
+                                 printf("DTS audio not supported in browsers\n");
+                                 webCodec = ""; // Skip
+                             } else if (codecId == "A_TRUEHD") {
+                                 // TrueHD is generally not supported in browsers
+                                 printf("TrueHD audio not supported in browsers\n");
+                                 webCodec = "";
+                             } else {
+                                 printf("Unknown audio codec: %s\n", codecId.c_str());
+                                 webCodec = "";
+                             }
+                             
+                             if (!webCodec.empty()) {
+                                 audioTrack.set("codec", webCodec);
+                                 audioTrack.set("codecId", codecId);
+                                 audioTrack.set("sampleRate", sampleRate > 0 ? (int)sampleRate : 48000);
+                                 audioTrack.set("numberOfChannels", channels > 0 ? (int)channels : 2);
+                                 if (codecPrivate.as<bool>()) {
+                                     audioTrack.set("description", codecPrivate);
+                                 }
+                                 
+                                 // Add to audioTracks array
+                                 if (!metadata["audioTracks"].as<bool>()) {
+                                     metadata.set("audioTracks", val::array());
+                                 }
+                                 metadata["audioTracks"].call<void>("push", audioTrack);
+                             }
                       }
                  }
                  break; // Found tracks
@@ -296,37 +403,39 @@ public:
                          KaxSimpleBlock* block = static_cast<KaxSimpleBlock*>(e);
                          block->SetParent(*cluster); 
 
-                         if (block->NumberFrames() == 0) continue; 
-                         
-                         DataBuffer& db = block->GetBuffer(0);
-                         size_t size = db.Size();
-                         uint8_t* data = db.Buffer();
-                         
-                         if (!data || size == 0) continue;
-                         
-                         int trackNum = block->TrackNum();
-                         
-                         // Timestamp calc
-                         int16_t relativeTime = block->GetRelativeTimestamp();
-                         uint64_t timestamp = (clusterTimecode * 1000000) + ((int64_t)relativeTime * 1000000); 
+                         int frameCount = block->NumberFrames();
+                         for (int f = 0; f < frameCount; f++) {
+                             DataBuffer& db = block->GetBuffer(f);
+                             size_t size = db.Size();
+                             uint8_t* data = db.Buffer();
+                             
+                             if (!data || size == 0) continue;
+                             
+                             int trackNum = block->TrackNum();
+                             
+                             // Timestamp calc - Laced frames usually share the block timestamp or are equidistant
+                             // For simplicity we use the block timestamp for all laced frames for now. 
+                             // Ideally we should increment if we knew the duration.
+                             int16_t relativeTime = block->GetRelativeTimestamp();
+                             uint64_t timestamp = (clusterTimecode * 1000000) + ((int64_t)relativeTime * 1000000); 
 
-                         val packet = val::object();
-                         packet.set("trackId", trackNum);
-                         packet.set("timestamp", (double)timestamp / 1000000.0);
-                         packet.set("isKey", block->IsKeyframe());
-                         
-                         // Debug: data size
-                         // EM_ASM({ console.log('C++: Data Size: ' + $0); }, size);
-                         
-                         // Slow copy to JS Array to verify stability
-                         val jsData = val::array();
-                         for (size_t x = 0; x < size; x++) {
-                             jsData.call<void>("push", data[x]);
+                             val packet = val::object();
+                             packet.set("trackId", trackNum);
+                             // If it's audio, they are laced. We might need to adjust timestamp if we wanted perfect precision
+                             // different decoders behave differently. Sending same TS for batch of frames is often OK for WebCodecs.
+                             packet.set("timestamp", (double)timestamp / 1000000.0);
+                             packet.set("isKey", block->IsKeyframe());
+                             
+                             // Slow copy to JS Array
+                             val jsData = val::array();
+                             for (size_t x = 0; x < size; x++) {
+                                 jsData.call<void>("push", data[x]);
+                             }
+                             
+                             packet.set("data", jsData);
+                             
+                             queued_packets.push_back(packet);
                          }
-                         
-                         packet.set("data", jsData);
-                         
-                         queued_packets.push_back(packet);
                      }
                 }
                 // EM_ASM({ console.log('C++: Cluster Done'); });
