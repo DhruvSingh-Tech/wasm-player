@@ -144,8 +144,18 @@ export class MkvWasmTech extends Tech {
         this.isSeeking = true;
 
         // 1. Reset Decoders to abandon pending work/frames
-        if (this.videoDecoder) this.videoDecoder.reset();
-        if (this.audioDecoder) this.audioDecoder.reset();
+        if (this.videoDecoder) {
+            this.videoDecoder.reset();
+            if (this.activeVideoConfig) {
+                this.videoDecoder.configure(this.activeVideoConfig);
+            }
+        }
+        if (this.audioDecoder) {
+            this.audioDecoder.reset();
+            if (this.activeAudioConfig) {
+                this.audioDecoder.configure(this.activeAudioConfig);
+            }
+        }
 
         // 2. Clear AVController queues
         if (this.avController) {
@@ -242,7 +252,15 @@ export class MkvWasmTech extends Tech {
                 this.trigger('error', msg.error);
                 break;
             case 'seeked':
-                console.log('[MkvWasmTech] Worker seeked. Target TS:', msg.timestamp);
+                console.log('[MkvWasmTech] Worker seeked. Target TS (ms):', msg.timestamp);
+
+                // Sync AVController to the ACTUAL timestamp we landed on (Keyframe)
+                // This avoids AVController waiting for frames if we landed ahead of requested time
+                // MSG timestamp is in ms, AVController expects seconds.
+                if (this.avController) {
+                    this.avController.seek(msg.timestamp / 1000);
+                }
+
                 this.isSeeking = false;
                 this.trigger('seeked');
                 break;
@@ -418,7 +436,8 @@ export class MkvWasmTech extends Tech {
             });
 
             try {
-                this.videoDecoder.configure(result.config || decoderConfig);
+                this.activeVideoConfig = result.config || decoderConfig;
+                this.videoDecoder.configure(this.activeVideoConfig);
                 console.log('[MkvWasmTech] VideoDecoder configured successfully');
             } catch (e) {
                 console.error('[MkvWasmTech] VideoDecoder Configuration Failed:', e);
@@ -473,7 +492,8 @@ export class MkvWasmTech extends Tech {
             });
 
             try {
-                this.audioDecoder.configure(result.config || decoderConfig);
+                this.activeAudioConfig = result.config || decoderConfig;
+                this.audioDecoder.configure(this.activeAudioConfig);
                 console.log('[MkvWasmTech] AudioDecoder configured successfully');
                 // Initialize audio context NOW so it's ready for incoming audio
                 this.avController.initAudio();

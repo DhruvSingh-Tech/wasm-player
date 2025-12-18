@@ -10,6 +10,7 @@ let abortController = null;
 let tracksFound = false;
 let currentUrl = null;
 let seekTargetTime = -1; // -1 means no seek pending
+let videoTrackId = null;
 
 self.onmessage = async (e) => {
     const { cmd, url, time } = e.data;
@@ -32,6 +33,7 @@ self.onmessage = async (e) => {
             }
             currentUrl = url;
             seekTargetTime = -1;
+            videoTrackId = null;
             startStream(url);
             break;
         case 'seek':
@@ -110,6 +112,7 @@ async function startStream(url) {
                 const metadata = demuxer.get_metadata();
                 if (metadata && metadata.videoTrack) {
                     // console.log('Worker: Tracks found!');
+                    videoTrackId = metadata.videoTrack.trackId;
                     if (seekTargetTime < 0) {
                         self.postMessage({ type: 'metadata', data: metadata });
                     }
@@ -122,14 +125,32 @@ async function startStream(url) {
                     let packet;
                     while ((packet = demuxer.read_packet()) != null) {
                         // Handle Seek Skipping
+                        // Handle Seek Skipping
                         if (seekTargetTime >= 0) {
                             if (packet.timestamp < seekTargetTime) {
                                 // Skip this packet
                                 continue;
+                            }
+
+                            // Reached time target. 
+                            // Ensure we start on a Video Keyframe to prevent decoding errors (freeze)
+                            if (videoTrackId !== null) {
+                                if (packet.trackId === videoTrackId) {
+                                    if (!packet.isKey) {
+                                        continue; // Skip P-frames/B-frames until Keyframe
+                                    }
+                                    // Found Keyframe!
+                                    // console.log('Worker: Seek synced at Keyframe', packet.timestamp);
+                                    seekTargetTime = -1;
+                                    self.postMessage({ type: 'seeked', timestamp: packet.timestamp });
+                                } else {
+                                    // Audio/Sub track. Skip until we sync video.
+                                    continue;
+                                }
                             } else {
-                                // Reached target!
-                                console.log('Worker: Seek reached target', packet.timestamp);
-                                seekTargetTime = -1; // Seek complete
+                                // No video track, just time seek is enough
+                                console.log('Worker: Seek reached target (No Video)', packet.timestamp);
+                                seekTargetTime = -1;
                                 self.postMessage({ type: 'seeked', timestamp: packet.timestamp });
                             }
                         }
