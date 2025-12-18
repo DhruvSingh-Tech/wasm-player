@@ -141,7 +141,23 @@ public:
              if (upperLevel > 0) {
                  break; 
              }
-             if (EbmlId(*el) == KaxTracks::ClassInfos.GlobalId) {
+             if (EbmlId(*el) == KaxInfo::ClassInfos.GlobalId) {
+                 KaxInfo* info = static_cast<KaxInfo*>(el);
+                 info->Read(*stream, KaxInfo::ClassInfos.Context, dummyUpper, el, true);
+                 
+                 KaxDuration* dur = dynamic_cast<KaxDuration*>(info->FindFirstElt(KaxDuration::ClassInfos, false));
+                 KaxTimestampScale* tcs = dynamic_cast<KaxTimestampScale*>(info->FindFirstElt(KaxTimestampScale::ClassInfos, false));
+                 
+                 double duration = 0;
+                 if (dur) duration = double(*dur);
+                 
+                 uint64_t scale = 1000000;
+                 if (tcs) scale = uint64_t(*tcs);
+                 
+                 double durationSeconds = (duration * scale) / 1000000000.0;
+                 metadata.set("duration", durationSeconds);
+                 
+             } else if (EbmlId(*el) == KaxTracks::ClassInfos.GlobalId) {
                  KaxTracks* tracks = static_cast<KaxTracks*>(el);
                  tracks->Read(*stream, KaxTracks::ClassInfos.Context, dummyUpper, el, true);
                  
@@ -405,11 +421,7 @@ public:
 
                          int frameCount = block->NumberFrames();
                          for (int f = 0; f < frameCount; f++) {
-                             DataBuffer& db = block->GetBuffer(f);
-                             size_t size = db.Size();
-                             uint8_t* data = db.Buffer();
-                             
-                             if (!data || size == 0) continue;
+
                              
                              int trackNum = block->TrackNum();
                              
@@ -419,12 +431,30 @@ public:
                              int16_t relativeTime = block->GetRelativeTimestamp();
                              uint64_t timestamp = (clusterTimecode * 1000000) + ((int64_t)relativeTime * 1000000); 
 
+                             double ts_seconds = (double)timestamp / 1000000000.0; // ns -> seconds
+
+                             // Optimization: Skip if we are seeking and this is too early
+                             if (seek_target >= 0 && ts_seconds < seek_target) {
+                                 continue;
+                             }
+                             
+                             // If we reached here, we found our target!
+                             if (seek_target >= 0) {
+                                 // EM_ASM({ console.log('C++: Seek Reached Target at ' + $0); }, ts_seconds);
+                                 seek_target = -1.0; // Reset
+                             }
+
                              val packet = val::object();
                              packet.set("trackId", trackNum);
-                             // If it's audio, they are laced. We might need to adjust timestamp if we wanted perfect precision
-                             // different decoders behave differently. Sending same TS for batch of frames is often OK for WebCodecs.
+                             // Return milliseconds for JS compatibility
                              packet.set("timestamp", (double)timestamp / 1000000.0);
                              packet.set("isKey", block->IsKeyframe());
+                             
+                             DataBuffer& db = block->GetBuffer(f);
+                             size_t size = db.Size();
+                             uint8_t* data = db.Buffer();
+                             
+                             if (!data || size == 0) continue;
                              
                              // Slow copy to JS Array
                              val jsData = val::array();
@@ -455,6 +485,20 @@ public:
         return val::null();
     }
 
+    double seek_target = -1.0;
+
+    void seek(double timestamp) {
+        queued_packets.clear();
+        cluster_search_pos = 0; 
+        seek_target = timestamp;
+    }
+    
+    void flush() {
+         queued_packets.clear();
+         seek_target = -1.0;
+    }
+    
+
 };
 
 EMSCRIPTEN_BINDINGS(my_module) {
@@ -462,5 +506,7 @@ EMSCRIPTEN_BINDINGS(my_module) {
         .constructor<>()
         .function("push_data", &MkvDemuxer::push_data)
         .function("get_metadata", &MkvDemuxer::get_metadata)
-        .function("read_packet", &MkvDemuxer::read_packet);
+        .function("read_packet", &MkvDemuxer::read_packet)
+        .function("seek", &MkvDemuxer::seek)
+        .function("flush", &MkvDemuxer::flush);
 }

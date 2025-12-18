@@ -8,6 +8,8 @@ let abortController = null;
 
 // Track state
 let tracksFound = false;
+let currentUrl = null;
+let seekTargetTime = -1; // -1 means no seek pending
 
 self.onmessage = async (e) => {
     const { cmd, url, time } = e.data;
@@ -18,6 +20,7 @@ self.onmessage = async (e) => {
         case 'fetch':
             if (fetching) {
                 if (abortController) abortController.abort();
+                fetching = false;
             }
             if (!demuxer) {
                 try {
@@ -27,10 +30,38 @@ self.onmessage = async (e) => {
                     return;
                 }
             }
+            currentUrl = url;
+            seekTargetTime = -1;
             startStream(url);
             break;
         case 'seek':
-            console.log('Worker: Seeking (Not fully impl in C++ yet) to', time);
+            console.log('Worker: Seeking to', time);
+            if (!currentUrl) {
+                console.error('Worker: Cannot seek, no URL set');
+                return;
+            }
+            // Stop current stream
+            if (abortController) abortController.abort();
+            fetching = false;
+
+            // Wait a tick for cleanup?
+            setTimeout(async () => {
+                // Reset demuxer to clear buffers
+                if (demuxer) {
+                    demuxer.delete();
+                    demuxer = null;
+                }
+                await initWasm(); // Re-init fresh
+
+                // Set C++ optimization target (seconds)
+                // This makes C++ skip packets internally without copying data
+                if (demuxer) {
+                    demuxer.seek(time);
+                }
+
+                seekTargetTime = time * 1000; // Keep JS check for safety (ms)
+                startStream(currentUrl);
+            }, 10);
             break;
         case 'close':
             fetching = false;
@@ -42,7 +73,7 @@ async function initWasm() {
     try {
         const module = await createDemuxer();
         demuxer = new module.MkvDemuxer();
-        console.log('Worker: REAL WASM Demuxer Initialized');
+        // console.log('Worker: REAL WASM Demuxer Initialized');
         self.postMessage({ type: 'ready' });
     } catch (err) {
         console.error('Worker: WASM Init failed', err);
@@ -52,7 +83,8 @@ async function initWasm() {
 
 async function startStream(url) {
     fetching = true;
-    tracksFound = false;
+    tracksFound = false; // We will re-find tracks, but we might want to skip metadata event? 
+    // Actually, fine to re-send metadata or we can flag it.
     abortController = new AbortController();
 
     try {
@@ -67,14 +99,9 @@ async function startStream(url) {
 
         while (fetching) {
             const { done, value } = await reader.read();
-            if (done) {
-                break;
-            }
+            if (done) break;
 
-            if (!demuxer) {
-                console.error('Demuxer is null inside fetch loop!');
-                break;
-            }
+            if (!demuxer) break;
 
             // Push data to C++
             demuxer.push_data(value);
@@ -82,28 +109,38 @@ async function startStream(url) {
             if (!tracksFound) {
                 const metadata = demuxer.get_metadata();
                 if (metadata && metadata.videoTrack) {
-                    console.log('Worker: Tracks found!', metadata);
-                    self.postMessage({ type: 'metadata', data: metadata });
+                    // console.log('Worker: Tracks found!');
+                    if (seekTargetTime < 0) {
+                        self.postMessage({ type: 'metadata', data: metadata });
+                    }
                     tracksFound = true;
                 }
             }
 
             if (tracksFound) {
-                // Loop to read all available packets in the buffer
                 try {
                     let packet;
                     while ((packet = demuxer.read_packet()) != null) {
-                        // Packet struct: { trackId, timestamp (ms), isKey, data (Uint8Array) }
+                        // Handle Seek Skipping
+                        if (seekTargetTime >= 0) {
+                            if (packet.timestamp < seekTargetTime) {
+                                // Skip this packet
+                                continue;
+                            } else {
+                                // Reached target!
+                                console.log('Worker: Seek reached target', packet.timestamp);
+                                seekTargetTime = -1; // Seek complete
+                                self.postMessage({ type: 'seeked', timestamp: packet.timestamp });
+                            }
+                        }
 
-                        // Transfer buffer to main thread
+                        // Normal processing
                         if (packet) {
-                            // Convert JS Array to Uint8Array if needed (handling the C++ slow copy fix)
                             if (packet.data && Array.isArray(packet.data)) {
                                 packet.data = new Uint8Array(packet.data);
                             }
 
                             if (packet.data && packet.data.byteLength > 0) {
-                                // console.log('Worker: Received packet', packet.trackId, packet.timestamp);
                                 self.postMessage({
                                     type: 'packet',
                                     trackId: packet.trackId,
@@ -111,19 +148,13 @@ async function startStream(url) {
                                     isKey: packet.isKey,
                                     data: packet.data
                                 }, [packet.data.buffer]);
-                            } else {
-                                console.log('Worker: Packet received but empty data');
                             }
                         }
                     }
                 } catch (e) {
-                    console.error('WASM Read Packet Error:', e, typeof e);
-                    if (typeof e === 'number') {
-                        // Was it a pointer? Maybe an Abort?
-                        console.error('Thrown number usually means C++ throw or Abort. Value:', e);
-                    }
+                    console.error('WASM Read Packet Error:', e);
                 }
-            } // End if tracksFound
+            }
 
             await new Promise(r => setTimeout(r, 0));
         }

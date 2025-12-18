@@ -63,10 +63,34 @@ export class AVController {
         }
 
         let written = 0;
+        const masterTime = this.getMasterTime();
 
         while (written < bufferSize) {
             // Get next chunk if needed
             if (!this.currentAudioChunk && this.audioQueue.length > 0) {
+                const nextChunk = this.audioQueue[0];
+
+                // Sync Check
+                // 1. Drop late audio (more than 0.2s behind)
+                if (nextChunk.pts < masterTime - 0.2) {
+                    // console.warn('Dropping late audio chunk', nextChunk.pts, masterTime);
+                    this.audioQueue.shift();
+                    continue;
+                }
+
+                // 2. Wait for future audio (more than 0.2s ahead)
+                // If the next chunk is too far in the future, we output silence 
+                // until time catches up.
+                if (nextChunk.pts > masterTime + 0.2) {
+                    // console.log('Waiting for audio...', nextChunk.pts, masterTime);
+                    // Fill remainder with silence
+                    for (let i = written; i < bufferSize; i++) {
+                        outputL[i] = 0;
+                        outputR[i] = 0;
+                    }
+                    return; // Exit, effectively waiting
+                }
+
                 this.currentAudioChunk = this.audioQueue.shift();
                 this.audioReadIndex = 0;
             }
@@ -87,17 +111,46 @@ export class AVController {
             // Calculate resampling ratio
             const ratio = inputSampleRate / this.outputSampleRate;
 
-            // Resample and output
+            // Resample and output with Downmixing
             while (written < bufferSize && this.audioReadIndex < chunkSamples) {
                 const srcIdx = Math.floor(this.audioReadIndex);
                 const nextIdx = Math.min(srcIdx + 1, chunkSamples - 1);
                 const frac = this.audioReadIndex - srcIdx;
 
-                // Linear interpolation
-                const sampleL = chunk.samples[0][srcIdx] * (1 - frac) + chunk.samples[0][nextIdx] * frac;
-                const sampleR = chunk.samples.length > 1
-                    ? chunk.samples[1][srcIdx] * (1 - frac) + chunk.samples[1][nextIdx] * frac
-                    : sampleL;
+                // 5.1 Downmix coefficients (simplified)
+                // L_out = L + 0.707*C + 0.707*Ls
+                // R_out = R + 0.707*C + 0.707*Rs
+
+                let sampleL = 0;
+                let sampleR = 0;
+
+                const getSample = (ch, idx) => {
+                    return chunk.samples[ch][idx] * (1 - frac) + chunk.samples[ch][nextIdx] * frac;
+                }
+
+                if (chunk.samples.length >= 6) {
+                    // 5.1 layout: L, R, C, LFE, Ls, Rs
+                    const L = getSample(0, srcIdx);
+                    const R = getSample(1, srcIdx);
+                    const C = getSample(2, srcIdx);
+                    const Ls = getSample(4, srcIdx);
+                    const Rs = getSample(5, srcIdx);
+
+                    sampleL = L + 0.707 * C + 0.5 * Ls;
+                    sampleR = R + 0.707 * C + 0.5 * Rs;
+
+                    // Normalize to prevent clipping
+                    sampleL *= 0.8;
+                    sampleR *= 0.8;
+                } else if (chunk.samples.length >= 2) {
+                    // Stereo
+                    sampleL = getSample(0, srcIdx);
+                    sampleR = getSample(1, srcIdx);
+                } else {
+                    // Mono
+                    sampleL = getSample(0, srcIdx);
+                    sampleR = sampleL;
+                }
 
                 outputL[written] = sampleL;
                 outputR[written] = sampleR;
@@ -181,10 +234,14 @@ export class AVController {
     reset() {
         this.videoQueue.forEach(i => i.frame.close());
         this.videoQueue = [];
+        this.clearAudioQueue();
+        this.mediaStartTime = 0;
+    }
+
+    clearAudioQueue() {
         this.audioQueue = [];
         this.currentAudioChunk = null;
         this.audioReadIndex = 0;
-        this.mediaStartTime = 0;
     }
 
     renderLoop() {
@@ -243,8 +300,10 @@ export class AVController {
     seek(time) {
         this.mediaStartTime = time;
         this.audioStartTime = this.audioContext ? this.audioContext.currentTime : 0;
-        this.audioQueue = [];
-        this.currentAudioChunk = null;
-        this.audioReadIndex = 0;
+
+        // Clear all queues
+        this.videoQueue.forEach(i => i.frame.close());
+        this.videoQueue = [];
+        this.clearAudioQueue();
     }
 }

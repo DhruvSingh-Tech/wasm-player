@@ -24,8 +24,11 @@ export class MkvWasmTech extends Tech {
         this.currentLoop = null;
         this.isSeeking = false;
         this.internalPaused = true;
+        this.isSeeking = false;
 
         this.bufferState = { video: [], audio: [] };
+        this.readyState = 0; // HAVE_NOTHING
+        this.duration_ = 0; // Will be set when metadata arrives
 
         console.log('[MkvWasmTech] Constructor called');
 
@@ -87,27 +90,77 @@ export class MkvWasmTech extends Tech {
     }
 
     async play() {
+        console.log('[MkvWasmTech] play() called, internalPaused:', this.internalPaused);
         if (this.internalPaused) {
             this.internalPaused = false;
             await this.avController.play();
             this.trigger('play');
+        }
+
+        // Always start timeupdate interval for Video.js (idempotent)
+        this.startTimeUpdateTimer();
+    }
+
+    startTimeUpdateTimer() {
+        if (this.timeUpdateInterval) return;
+        console.log('[MkvWasmTech] Starting timeupdate timer');
+
+        this.timeUpdateInterval = setInterval(() => {
+            if (!this.internalPaused) {
+                const time = this.currentTime();
+
+                // Update player cache directly
+                if (this.player_) {
+                    this.player_.cache_ = this.player_.cache_ || {};
+                    this.player_.cache_.currentTime = time;
+                }
+
+                // Dispatch DOM event as well
+                if (this.el_) {
+                    this.el_.dispatchEvent(new Event('timeupdate', { bubbles: true }));
+                }
+
+                this.trigger('timeupdate');
+            }
+        }, 250);
+    }
+
+    stopTimeUpdateTimer() {
+        if (this.timeUpdateInterval) {
+            clearInterval(this.timeUpdateInterval);
+            this.timeUpdateInterval = null;
         }
     }
 
     pause() {
         this.internalPaused = true;
         this.avController.pause();
+        this.stopTimeUpdateTimer();
         this.trigger('pause');
     }
 
     setCurrentTime(seconds) {
+        console.log('[MkvWasmTech] setCurrentTime called:', seconds);
+        this.isSeeking = true;
+
+        // 1. Reset Decoders to abandon pending work/frames
+        if (this.videoDecoder) this.videoDecoder.reset();
+        if (this.audioDecoder) this.audioDecoder.reset();
+
+        // 2. Clear AVController queues
         if (this.avController) {
             this.avController.seek(seconds);
         }
+
+        // 3. Send seek command to worker (restarts demuxer & skips)
         if (this.worker) {
             this.worker.postMessage({ cmd: 'seek', time: seconds });
         }
+
+        // 4. Update UI state
         this.trigger('seeking');
+        // Show loading spinner
+        this.trigger('waiting');
     }
 
     currentTime() {
@@ -118,6 +171,7 @@ export class MkvWasmTech extends Tech {
     }
 
     duration() {
+        // console.log('[MkvWasmTech] duration queried:', this.duration_);
         return this.duration_ || 0;
     }
 
@@ -127,6 +181,8 @@ export class MkvWasmTech extends Tech {
         // Todo: Implement rate control in AVController
         return 1;
     }
+
+    featuresNativeTextTracks = false;
 
     muted(muted) {
         if (muted === undefined) return false;
@@ -138,6 +194,22 @@ export class MkvWasmTech extends Tech {
         if (vol === undefined) return 1;
         // Todo: Implement volume in AVController/GainNode
         return 1;
+    }
+
+    seekable() {
+        const duration = this.duration();
+        console.log('[MkvWasmTech] seekable called. duration:', duration);
+        const createTimeRanges = videojs.time?.createTimeRanges || videojs.createTimeRanges;
+        if (duration === 0) return createTimeRanges();
+        return createTimeRanges(0, duration);
+    }
+
+    buffered() {
+        const duration = this.duration();
+        const createTimeRanges = videojs.time?.createTimeRanges || videojs.createTimeRanges;
+        if (duration === 0) return createTimeRanges();
+        // Claim full buffer for seekability
+        return createTimeRanges(0, duration);
     }
 
     paused() {
@@ -160,37 +232,145 @@ export class MkvWasmTech extends Tech {
                 this.handleMetadata(msg.data);
                 break;
             case 'packet':
+                if (this.isSeeking) {
+                    // console.log('[MkvWasmTech] Ignoring packet during seek');
+                    return;
+                }
                 this.queuePacket(msg);
                 break;
             case 'error':
                 this.trigger('error', msg.error);
                 break;
+            case 'seeked':
+                console.log('[MkvWasmTech] Worker seeked. Target TS:', msg.timestamp);
+                this.isSeeking = false;
+                this.trigger('seeked');
+                break;
         }
     }
 
     handleMetadata(metadata) {
+        console.log('[MkvWasmTech] Metadata Received:', metadata);
         // metadata: { duration, videoTrack, audioTracks }
         this.duration_ = metadata.duration;
-        this.trigger('durationchange');
+
+        // Update player cache directly (workaround for Video.js not picking up tech.duration())
+        if (this.player_) {
+            this.player_.cache_ = this.player_.cache_ || {};
+            this.player_.cache_.duration = metadata.duration;
+        }
+
+        // Setup Video and Audio Decoders
 
         // Configure Decoders
         if (metadata.videoTrack) {
             this.videoTrackId = metadata.videoTrack.trackId;
             this.setupVideoDecoder(metadata.videoTrack);
         }
-        // Setup Audio
+
+        // Setup Audio Tracks
         if (metadata.audioTracks && metadata.audioTracks.length > 0) {
-            const audioTrack = metadata.audioTracks[0];
-            this.audioTrackId = audioTrack.trackId;
-            this.setupAudioDecoder(audioTrack);
+            // Get the AudioTrackList from the player (via tech's APIs if possible)
+            // Or create our own internal list and expose it
+
+            // Note: Video.js Techs usually interact with HTML5 tracks unless custom.
+            // We'll access the player's AudioTrackList if available, or assume standard API.
+
+            // For this environment, we assume we can add tracks to the player or tech
+            // Video.js 7+ has specific API for this.
+
+            // Let's store raw configs for switching
+            this.audioTrackConfigs = {};
+            metadata.audioTracks.forEach(t => {
+                this.audioTrackConfigs[t.trackId] = t;
+            });
+
+            // Find specific AudioTrackList associated with this Tech
+            const tracks = this.audioTracks();
+
+            // Clear existing
+            // tracks.on('change', null); // todo: clean up listeners
+            // While we can't easily clear, we can assume new load.
+
+            metadata.audioTracks.forEach((track, index) => {
+                const audioTrack = new videojs.AudioTrack({
+                    id: String(track.trackId),
+                    kind: 'main',
+                    label: track.label || `Track ${index + 1} (${track.codec})`,
+                    language: track.language || 'und',
+                    enabled: index === 0 // Enable first by default
+                });
+                tracks.addTrack(audioTrack);
+            });
+
+            // Listen for changes
+            tracks.on('change', () => {
+                for (let i = 0; i < tracks.length; i++) {
+                    const track = tracks[i];
+                    if (track.enabled) {
+                        const trackId = parseInt(track.id);
+                        if (this.audioTrackId !== trackId) {
+                            console.log(`[MkvWasmTech] Switching to Audio Track ${trackId}`);
+                            this.switchAudioTrack(trackId);
+                        }
+                        return;
+                    }
+                }
+            });
+
+            // Setup initial decoder
+            const firstTrack = metadata.audioTracks[0];
+            this.audioTrackId = firstTrack.trackId;
+            this.setupAudioDecoder(firstTrack);
+
         } else {
             console.log('[MkvWasmTech] No audio tracks found');
             this.avController.initAudio(); // Ensure context is ready for video-only
         }
-        this.trigger('loadedmetadata');
-        // Signal that we have enough data to start
-        this.trigger('loadeddata');
-        this.trigger('canplay');
+
+        // Delay triggers to ensure listener attachment and proper state transition
+        setTimeout(() => {
+            console.log('[MkvWasmTech] Triggering Metadata Events');
+
+            this.readyState = 4; // HAVE_ENOUGH_DATA
+
+            // Video.js listens to DOM events on the tech element
+            const opts = { bubbles: true, cancelable: false };
+            this.el_.dispatchEvent(new Event('durationchange', opts));
+            this.el_.dispatchEvent(new Event('loadedmetadata', opts));
+            this.el_.dispatchEvent(new Event('loadeddata', opts));
+            this.el_.dispatchEvent(new Event('canplay', opts));
+
+            // Also trigger internal
+            this.trigger('durationchange');
+            this.trigger('loadedmetadata');
+            this.trigger('loadeddata');
+            this.trigger('canplay');
+        }, 10);
+    }
+
+    switchAudioTrack(trackId) {
+        const config = this.audioTrackConfigs[trackId];
+        if (!config) return;
+
+        this.audioTrackId = trackId;
+
+        // 1. Close existing decoder
+        if (this.audioDecoder) {
+            this.audioDecoder.close();
+            this.audioDecoder = null;
+        }
+
+        // 2. Clear queued audio
+        this.avController.clearAudioQueue();
+
+        // 3. Setup new decoder
+        this.setupAudioDecoder(config);
+
+        // 4. Seek to current time to restart stream for new track
+        const now = this.currentTime();
+        console.log(`[MkvWasmTech] Seek to ${now} to sync new audio track`);
+        this.setCurrentTime(now);
     }
 
     setupVideoDecoder(config) {
@@ -308,8 +488,11 @@ export class MkvWasmTech extends Tech {
     queuePacket(packet) {
         // packet: { trackId, timestamp, isKey, data }
         if (this.videoDecoder && packet.trackId === this.videoTrackId) {
+            // Check decoder state before decoding
+            if (this.videoDecoder.state !== 'configured') {
+                return;
+            }
             try {
-                // console.log('[MkvWasmTech] Video Packet TS:', packet.timestamp, 'ms');
                 const chunk = new EncodedVideoChunk({
                     type: packet.isKey ? 'key' : 'delta',
                     timestamp: packet.timestamp * 1000, // ms -> microseconds
@@ -320,7 +503,10 @@ export class MkvWasmTech extends Tech {
                 console.error('[MkvWasmTech] Video Decode Error:', e);
             }
         } else if (this.audioDecoder && packet.trackId === this.audioTrackId) {
-            // Decode audio immediately (same as video) so both queues start from timestamp 0
+            // Check decoder state before decoding
+            if (this.audioDecoder.state !== 'configured') {
+                return;
+            }
             try {
                 const chunk = new EncodedAudioChunk({
                     type: 'key',
