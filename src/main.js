@@ -5,9 +5,10 @@ import './tech/MkvWasmTech.js';
 const player = videojs('my-player', {
   techOrder: ['MkvWasm'], // Force use of our custom tech
   sources: [{
-    src: 'https://pub-6b25c191839c4b01a878de4fdde0227b.r2.dev/8d8118cffa904fe68b8c02f562c36160?token=1765856945',
+    // src: 'https://pub-6b25c191839c4b01a878de4fdde0227b.r2.dev/8d8118cffa904fe68b8c02f562c36160?token=1765856945',
     // src: '/test5.mkv',
-    // src: "https://0.ios37.workers.dev/ec86f8d15aed59884492ded48419adfa/driveseed.org/The.Fantastic.Four.First.Steps.2025.Imax.1080P.10bit.Web-Dl.Hindi.English.Msubs.MoviesMod.plus.mkv",
+    // src: "https://pub-e03c4e310afa4348887dec6ad52ff297.r2.dev/7340d61060773e67603f2f2edf036b8e/It.Welcome.To.Derry.S01E01.1080P.Hindi.English.Msubs.MoviesMod.plus.mkv",
+    src: "https://556138dca7367763ed46eecaa4284eca.r2.cloudflarestorage.com/hub2/Stranger.Things.S05E01.Chapter.One.The.Crawl.720p.NF.WEB-DL.DUAL.AAC5.1.x264-Vegamovies.hot.mkv?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=26b6cf8a0399b5880643f585c8c3dbe5%2F20251231%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20251231T110727Z&X-Amz-Expires=18000&X-Amz-SignedHeaders=host&response-content-disposition=Stranger.Things.S05E01.Chapter.One.The.Crawl.720p.NF.WEB-DL.DUAL.AAC5.1.x264-Vegamovies.hot.mkv&X-Amz-Signature=ce200aadcaa2438872e2029cfd780f1aaa7780351e7c79b7af8c5b7a003f7f9c",
     type: 'video/x-matroska'
   }]
 });

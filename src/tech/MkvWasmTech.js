@@ -43,6 +43,11 @@ export class MkvWasmTech extends Tech {
             this.trigger('timeupdate');
         });
 
+        // Sync initial volume/mute if options provided
+        // Video.js might set this later, but let's be safe
+        if (options.muted !== undefined) this.avController.setMuted(options.muted);
+        if (options.volume !== undefined) this.avController.setVolume(options.volume);
+
         this.initializeWorker();
 
         // Check if source is provided in options (common in Video.js initialization)
@@ -58,8 +63,22 @@ export class MkvWasmTech extends Tech {
     initializeUI() {
         this.videoCanvas = document.createElement('canvas');
         this.videoCanvas.className = 'vjs-tech';
+        // Ensure canvas fills the container so clicks are registered
+        this.videoCanvas.style.width = '100%';
+        this.videoCanvas.style.height = '100%';
+        this.videoCanvas.style.objectFit = 'contain';
+
         this.el_.appendChild(this.videoCanvas);
         this.ctx = this.videoCanvas.getContext('2d');
+
+        // Click to Toggle Play/Pause
+        this.videoCanvas.addEventListener('click', (e) => {
+            if (this.paused()) {
+                this.play();
+            } else {
+                this.pause();
+            }
+        });
     }
 
     initializeWorker() {
@@ -81,20 +100,39 @@ export class MkvWasmTech extends Tech {
         // this.cleanup(); // Don't kill worker here, just stop fetching
         // this.initializeWorker(); 
         console.log('[MkvWasmTech] Loading:', src);
+
+        // Reset state
+        this.internalPaused = true;
+        this.trigger('pause'); // Ensure UI shows pause state initially
+
         if (!this.worker) this.initializeWorker();
 
         // Send fetch command
         this.worker.postMessage({ cmd: 'fetch', url: src });
-        // Assume loading state
+
+        // Signal loading to Video.js
+        this.trigger('loadstart');
         this.trigger('waiting');
     }
 
     async play() {
         console.log('[MkvWasmTech] play() called, internalPaused:', this.internalPaused);
         if (this.internalPaused) {
-            this.internalPaused = false;
-            await this.avController.play();
-            this.trigger('play');
+            try {
+                this.internalPaused = false;
+                await this.avController.play();
+
+                // Trigger both Video.js event and DOM event to ensure UI updates
+                this.trigger('play');
+                this.el_.dispatchEvent(new Event('play', { bubbles: true }));
+
+                this.trigger('playing');
+                this.el_.dispatchEvent(new Event('playing', { bubbles: true }));
+            } catch (e) {
+                console.error('[MkvWasmTech] Play failed:', e);
+                this.internalPaused = true;
+                this.trigger('error', { code: 4, message: 'Playback Failed: ' + e.message });
+            }
         }
 
         // Always start timeupdate interval for Video.js (idempotent)
@@ -133,10 +171,15 @@ export class MkvWasmTech extends Tech {
     }
 
     pause() {
+        console.log('[MkvWasmTech] pause() called');
         this.internalPaused = true;
         this.avController.pause();
         this.stopTimeUpdateTimer();
+
         this.trigger('pause');
+        if (this.el_) {
+            this.el_.dispatchEvent(new Event('pause', { bubbles: true }));
+        }
     }
 
     setCurrentTime(seconds) {
@@ -192,18 +235,33 @@ export class MkvWasmTech extends Tech {
         return 1;
     }
 
-    featuresNativeTextTracks = false;
+    // Feature Flags for Video.js
+    featuresVolumeControl = true;
+    featuresPlaybackRate = true;
+    featuresProgressEvents = true;
+    featuresTimeupdateEvents = true;
+    featuresNativeTextTracks = false; // We don't have native text tracks yet
 
     muted(muted) {
-        if (muted === undefined) return false;
-        // Todo: Implement mute in AVController/AudioContext
-        return false;
+        if (muted === undefined) return this.avController ? this.avController.muted : false;
+        if (this.avController) {
+            console.log('[MkvWasmTech] setMuted:', muted);
+            this.avController.setMuted(muted);
+            this.trigger('volumechange');
+            if (this.el_) this.el_.dispatchEvent(new Event('volumechange', { bubbles: true }));
+        }
+        return muted;
     }
 
     volume(vol) {
-        if (vol === undefined) return 1;
-        // Todo: Implement volume in AVController/GainNode
-        return 1;
+        if (vol === undefined) return this.avController ? this.avController.volume : 1;
+        if (this.avController) {
+            console.log('[MkvWasmTech] setVolume:', vol);
+            this.avController.setVolume(vol);
+            this.trigger('volumechange');
+            if (this.el_) this.el_.dispatchEvent(new Event('volumechange', { bubbles: true }));
+        }
+        return vol;
     }
 
     seekable() {
@@ -344,6 +402,26 @@ export class MkvWasmTech extends Tech {
         } else {
             console.log('[MkvWasmTech] No audio tracks found');
             this.avController.initAudio(); // Ensure context is ready for video-only
+        }
+
+        // Setup Subtitle Tracks
+        if (metadata.subtitleTracks && metadata.subtitleTracks.length > 0) {
+            console.log('[MkvWasmTech] Subtitle Tracks:', metadata.subtitleTracks);
+            this.subtitleTracksMap = {};
+            // Clear existing tracks if possible?
+            // Since we re-init tech, we should be fine.
+
+            metadata.subtitleTracks.forEach((t, index) => {
+                // Determine label
+                let label = t.language || `Track ${index}`;
+                if (t.codecId) label += ` (${t.codecId})`;
+
+                const track = this.addTextTrack('subtitles', label, t.language || 'und');
+                // Map trackId to the TextTrack object
+                this.subtitleTracksMap[t.trackId] = track;
+
+                console.log(`[MkvWasmTech] Added subtitle track: ${t.trackId} -> ${label}`);
+            });
         }
 
         // Delay triggers to ensure listener attachment and proper state transition
@@ -537,6 +615,40 @@ export class MkvWasmTech extends Tech {
             } catch (e) {
                 console.error('[MkvWasmTech] Audio Decode Error:', e);
             }
+        } else if (this.subtitleTracksMap && this.subtitleTracksMap[packet.trackId]) {
+            this.handleSubtitlePacket(packet);
+        }
+    }
+
+    handleSubtitlePacket(packet) {
+        const track = this.subtitleTracksMap[packet.trackId];
+        if (!track) return;
+
+        try {
+            const text = new TextDecoder('utf-8').decode(packet.data);
+            if (!text || text.trim().length === 0) return;
+
+            const startTime = packet.timestamp / 1000; // ms -> seconds
+
+            // Use packet duration if available (mkv gives duration in TimecodeScale units, usually ms)
+            // packet.duration is just a raw number from C++ (unit depends on file, usually ms).
+            // Let's assume ms if present.
+            let duration = 4.0; // Default 4s
+            if (packet.duration && packet.duration > 0) {
+                duration = packet.duration / 1000.0;
+            }
+
+            const endTime = startTime + duration;
+
+            // Debug 
+            // console.log(`[MkvWasmTech] Subtitle: ${startTime} - ${endTime}: ${text}`);
+
+            const Cue = window.VTTCue || window.TextTrackCue;
+            const cue = new Cue(startTime, endTime, text);
+            track.addCue(cue);
+
+        } catch (e) {
+            console.error('[MkvWasmTech] Subtitle Error:', e);
         }
     }
 

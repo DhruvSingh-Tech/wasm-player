@@ -18,7 +18,12 @@ export class AVController {
 
         this.audioStartTime = 0;
         this.mediaStartTime = 0;
+        this.audioStartTime = 0;
+        this.mediaStartTime = 0;
         this.isPlaying = false;
+
+        this.volume = 1.0;
+        this.muted = false;
 
         this.audioContext = null;
         this.audioGain = null;
@@ -39,6 +44,7 @@ export class AVController {
             console.log('[AVController] AudioContext sampleRate:', this.outputSampleRate);
 
             this.audioGain = this.audioContext.createGain();
+            this.audioGain.gain.value = this.muted ? 0 : this.volume;
             this.audioGain.connect(this.audioContext.destination);
 
             // Use ScriptProcessorNode for reliable audio output
@@ -305,5 +311,19 @@ export class AVController {
         this.videoQueue.forEach(i => i.frame.close());
         this.videoQueue = [];
         this.clearAudioQueue();
+    }
+
+    setVolume(volume) {
+        this.volume = volume;
+        if (this.audioGain) {
+            this.audioGain.gain.value = this.muted ? 0 : this.volume;
+        }
+    }
+
+    setMuted(muted) {
+        this.muted = muted;
+        if (this.audioGain) {
+            this.audioGain.gain.value = this.muted ? 0 : this.volume;
+        }
     }
 }

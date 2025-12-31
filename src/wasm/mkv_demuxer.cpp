@@ -332,6 +332,21 @@ public:
                                  metadata["audioTracks"].call<void>("push", audioTrack);
                              }
                       }
+                      else if (trackType == 17) { // track_subtitle
+                             val subTrack = val::object();
+                             subTrack.set("trackId", (int)trackNum);
+                             // subTrack.set("language", language); // Need to capture language variable
+                             subTrack.set("codecId", codecId);
+                             
+                             if (codecPrivate.as<bool>()) {
+                                subTrack.set("codecPrivate", codecPrivate);
+                             }
+                             
+                             if (!metadata["subtitleTracks"].as<bool>()) {
+                                 metadata.set("subtitleTracks", val::array());
+                             }
+                             metadata["subtitleTracks"].call<void>("push", subTrack);
+                      }
                  }
                  break; // Found tracks
              }
@@ -465,6 +480,60 @@ public:
                              packet.set("data", jsData);
                              
                              queued_packets.push_back(packet);
+                         }
+                     } else if (EbmlId(*e) == KaxBlockGroup::ClassInfos.GlobalId) {
+                         KaxBlockGroup* blob = static_cast<KaxBlockGroup*>(e);
+                         
+                         KaxBlock* block = NULL;
+                         uint64_t duration = 0;
+                         bool hasDuration = false;
+
+                         for (size_t k = 0; k < blob->ListSize(); k++) {
+                             EbmlElement* sub = (*blob)[k];
+                             if (EbmlId(*sub) == KaxBlock::ClassInfos.GlobalId) {
+                                 block = static_cast<KaxBlock*>(sub);
+                                 block->SetParent(*cluster);
+                             } else if (EbmlId(*sub) == KaxBlockDuration::ClassInfos.GlobalId) {
+                                 KaxBlockDuration* dur = static_cast<KaxBlockDuration*>(sub);
+                                 duration = uint64_t(*dur);
+                                 hasDuration = true;
+                             }
+                         }
+
+                         if (block) {
+                             int frameCount = block->NumberFrames();
+                             for (int f = 0; f < frameCount; f++) {
+                                 int trackNum = block->TrackNum();
+                                 int16_t relativeTime = block->GetRelativeTimestamp();
+                                 uint64_t timestamp = (clusterTimecode * 1000000) + ((int64_t)relativeTime * 1000000); 
+                                 
+                                 if (seek_target >= 0 && ((double)timestamp/1000000000.0) < seek_target) {
+                                     continue;
+                                 }
+                                 if (seek_target >= 0) seek_target = -1.0; 
+
+                                 val packet = val::object();
+                                 packet.set("trackId", trackNum);
+                                 packet.set("timestamp", (double)timestamp / 1000000.0);
+                                 packet.set("isKey", true); 
+
+                                 if (hasDuration) {
+                                     packet.set("duration", (double)duration);
+                                 }
+
+                                 DataBuffer& db = block->GetBuffer(f);
+                                 size_t size = db.Size();
+                                 uint8_t* data = db.Buffer();
+
+                                 if (!data || size == 0) continue;
+
+                                 val jsData = val::array();
+                                 for (size_t x = 0; x < size; x++) {
+                                     jsData.call<void>("push", data[x]);
+                                 }
+                                 packet.set("data", jsData);
+                                 queued_packets.push_back(packet);
+                             }
                          }
                      }
                 }

@@ -42,18 +42,3 @@ body {
 .video-js .vjs-play-progress {
     background-color: var(--primary-color);
 }
-
-/* Ensure subtitles are visible on top of canvas */
-.video-js .vjs-text-track-display {
-    z-index: 2000;
-    pointer-events: none; /* Let clicks pass through to canvas */
-}
-
-/* Optional: style the cues for better visibility */
-.video-js .vjs-text-track-cue > div {
-    background: rgba(0, 0, 0, 0.7);
-    color: white;
-    font-size: 1.2em;
-    padding: 0.2em 0.5em;
-    border-radius: 4px;
-}
