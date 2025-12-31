@@ -56,6 +56,16 @@ public:
         std::vector<uint8_t> chunk(data.begin(), data.end());
         buffer.insert(buffer.end(), chunk.begin(), chunk.end());
     }
+
+    void maybe_prune() {
+        const size_t HEADER_KEEP = 2 * 1024 * 1024; // Keep 2MB for safety
+        if (cursor > 2 * HEADER_KEEP) {
+             size_t to_remove = cursor - HEADER_KEEP;
+             buffer.erase(buffer.begin(), buffer.begin() + to_remove);
+             total_offset += to_remove;
+             cursor -= to_remove;
+        }
+    }
     
     // ...
 
@@ -540,6 +550,8 @@ public:
                 // EM_ASM({ console.log('C++: Cluster Done'); });
                 delete cluster;
                 
+                io_callback.maybe_prune();
+
                 if (!queued_packets.empty()) {
                     val p = queued_packets.front();
                     queued_packets.erase(queued_packets.begin());
