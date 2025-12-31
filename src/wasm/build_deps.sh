@@ -1,8 +1,14 @@
 #!/bin/bash
 set -e
 
-mkdir -p deps
-cd deps
+
+# Resolve script directory to handle running from any location
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+# Target the 'deps' directory at the project root
+DEPS_DIR="$SCRIPT_DIR/../../deps"
+
+mkdir -p "$DEPS_DIR"
+cd "$DEPS_DIR"
 
 # 1. Build libebml
 if [ ! -d "libebml" ]; then
